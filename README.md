@@ -61,7 +61,7 @@ applications:
   - name: my-app
 
     buildpacks:
-      - https://github.example.com/example/jprofiler-buildpack.git
+      - https://github.com/johannesroesch/jprofiler-buildpack.git
       - java_buildpack                          # or sap_java_buildpack
 
     env:
