@@ -1,0 +1,277 @@
+#!/usr/bin/env bash
+# Cloud Foundry v2 supply buildpack – supply script
+#
+# Contract arguments:
+#   $1  BUILD_DIR   – application source directory
+#   $2  CACHE_DIR   – persistent cache directory across builds
+#   $3  DEPS_DIR    – root of all supply buildpack dependency directories
+#   $4  DEPS_IDX    – index of THIS buildpack (integer, not always 0)
+#
+# At runtime, ${DEPS_DIR}/${DEPS_IDX} is mounted at /home/vcap/deps/${DEPS_IDX}.
+#
+# Runtime injection strategy:
+#   We write a profile.d script to ${BUILD_DIR}/.profile.d/ (becomes
+#   /home/vcap/app/.profile.d/ at runtime, sourced by the CF launcher).
+#   We set JAVA_TOOL_OPTIONS rather than JAVA_OPTS because JAVA_TOOL_OPTIONS is
+#   read directly by the JVM itself (JVMTI spec), independent of which Java
+#   Buildpack assembles JAVA_OPTS.  This makes it robust against SAP Java
+#   Buildpack internals and profile.d ordering.
+#
+# See docs/design.md for the full rationale.
+
+set -euo pipefail
+
+BUILD_DIR="${1:?BUILD_DIR (arg 1) is required}"
+CACHE_DIR="${2:?CACHE_DIR (arg 2) is required}"
+DEPS_DIR="${3:?DEPS_DIR (arg 3) is required}"
+DEPS_IDX="${4:?DEPS_IDX (arg 4) is required}"
+
+# ── Central version configuration ────────────────────────────────────────────
+JPROFILER_VERSION="${JPROFILER_VERSION:-16.2.1}"
+
+# Version string used in archive filenames (dots → underscores)
+JPROFILER_VERSION_US="${JPROFILER_VERSION//./_}"
+
+JPROFILER_BASE_URL="https://download.ej-technologies.com/jprofiler"
+JPROFILER_SHA256_URL="${JPROFILER_BASE_URL}/sha256sums_${JPROFILER_VERSION_US}.txt"
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+log()  { echo "       $*"; }
+step() { echo "-----> $*"; }
+err()  { echo " !     ERROR: $*" >&2; exit 1; }
+warn() { echo " !     WARNING: $*"; }
+
+# Normalise boolean: accept true/True/TRUE/1/yes/on
+is_enabled() {
+    case "${1,,}" in
+        true|1|yes|on) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# ── Staging-time configuration ────────────────────────────────────────────────
+JPROFILER_ENABLED="${JPROFILER_ENABLED:-false}"
+
+step "JProfiler Supply Buildpack"
+log "JProfiler version: ${JPROFILER_VERSION}"
+
+if ! is_enabled "${JPROFILER_ENABLED}"; then
+    log "JPROFILER_ENABLED is false – skipping agent installation."
+    log "The buildpack completed successfully (no-op)."
+    exit 0
+fi
+
+# ── Architecture detection ────────────────────────────────────────────────────
+ARCH="$(uname -m)"
+log "Architecture: ${ARCH}"
+
+case "${ARCH}" in
+    x86_64)
+        JPROFILER_ARCH="linux-x86"
+        ;;
+    aarch64|arm64)
+        JPROFILER_ARCH="linux-arm"
+        ;;
+    *)
+        err "Unsupported CPU architecture '${ARCH}'. Supported: x86_64, aarch64/arm64."
+        ;;
+esac
+
+# ── Port validation ───────────────────────────────────────────────────────────
+JPROFILER_PORT="${JPROFILER_PORT:-8849}"
+if ! [[ "${JPROFILER_PORT}" =~ ^[0-9]+$ ]] || \
+   (( JPROFILER_PORT < 1 || JPROFILER_PORT > 65535 )); then
+    err "JPROFILER_PORT='${JPROFILER_PORT}' is invalid. Must be an integer between 1 and 65535."
+fi
+
+# ── Download URLs and expected checksums ──────────────────────────────────────
+ARCHIVE_NAME="jprofiler_agent_${JPROFILER_ARCH}_${JPROFILER_VERSION_US}.tar.gz"
+ARCHIVE_URL="${JPROFILER_BASE_URL}/${ARCHIVE_NAME}"
+
+# Known SHA256 checksums for official agent archives.
+# Update these when bumping JPROFILER_VERSION.
+declare -A KNOWN_SHA256=(
+    ["jprofiler_agent_linux-x86_16_2_1.tar.gz"]="5ef1e5acee0a17ac7f2df6ba9f626470c87c6c58ecdb0fbbb17a0d68487ba857"
+    ["jprofiler_agent_linux-arm_16_2_1.tar.gz"]="126614191ff847843391b0799ab4e35a7fc1fac62c343c67fbdd3caebc3195cd"
+)
+
+# ── Directories ───────────────────────────────────────────────────────────────
+INSTALL_DIR="${DEPS_DIR}/${DEPS_IDX}/jprofiler"
+PROFILE_D_DIR="${BUILD_DIR}/.profile.d"
+
+mkdir -p "${INSTALL_DIR}" "${PROFILE_D_DIR}"
+
+# ── Caching ───────────────────────────────────────────────────────────────────
+CACHED_ARCHIVE="${CACHE_DIR}/${ARCHIVE_NAME}"
+
+if [[ -f "${CACHED_ARCHIVE}" ]]; then
+    log "Using cached archive: ${ARCHIVE_NAME}"
+else
+    log "Downloading JProfiler agent: ${ARCHIVE_URL}"
+
+    # Use a temp file so a partial download is never mistaken for a complete one.
+    TMPFILE="$(mktemp /tmp/jprofiler-download.XXXXXX)"
+    trap 'rm -f "${TMPFILE}"' EXIT
+
+    if ! curl --silent --show-error --fail --location \
+              --connect-timeout 30 --max-time 300 \
+              -o "${TMPFILE}" "${ARCHIVE_URL}"; then
+        err "Failed to download JProfiler agent from ${ARCHIVE_URL}"
+    fi
+
+    mv "${TMPFILE}" "${CACHED_ARCHIVE}"
+    trap - EXIT
+fi
+
+# ── Checksum verification ─────────────────────────────────────────────────────
+EXPECTED_SHA="${KNOWN_SHA256[${ARCHIVE_NAME}]:-}"
+
+if [[ -n "${EXPECTED_SHA}" ]]; then
+    log "Verifying SHA256 checksum..."
+    ACTUAL_SHA="$(sha256sum "${CACHED_ARCHIVE}" | awk '{print $1}')"
+    if [[ "${ACTUAL_SHA}" != "${EXPECTED_SHA}" ]]; then
+        rm -f "${CACHED_ARCHIVE}"
+        err "SHA256 mismatch for ${ARCHIVE_NAME}.\
+ Expected: ${EXPECTED_SHA} Actual: ${ACTUAL_SHA}.\
+ Cached copy removed – retry staging to re-download."
+    fi
+    log "Checksum OK."
+else
+    warn "No embedded checksum for ${ARCHIVE_NAME} – attempting online verification."
+    TMPSHA="$(mktemp /tmp/jprofiler-sha.XXXXXX)"
+    trap 'rm -f "${TMPSHA}"' EXIT
+    if curl --silent --show-error --fail --location \
+            --connect-timeout 15 --max-time 30 \
+            -o "${TMPSHA}" "${JPROFILER_SHA256_URL}"; then
+        EXPECTED_SHA="$(grep "${ARCHIVE_NAME}" "${TMPSHA}" | awk '{print $1}')"
+        if [[ -n "${EXPECTED_SHA}" ]]; then
+            ACTUAL_SHA="$(sha256sum "${CACHED_ARCHIVE}" | awk '{print $1}')"
+            if [[ "${ACTUAL_SHA}" != "${EXPECTED_SHA}" ]]; then
+                rm -f "${CACHED_ARCHIVE}" "${TMPSHA}"
+                err "SHA256 mismatch for ${ARCHIVE_NAME} (online check)."
+            fi
+            log "Checksum OK (online)."
+        else
+            warn "Archive not found in online checksum file; skipping checksum."
+        fi
+    else
+        warn "Could not fetch online checksums; skipping checksum verification."
+    fi
+    rm -f "${TMPSHA}"
+    trap - EXIT
+fi
+
+# ── Extract archive ───────────────────────────────────────────────────────────
+log "Extracting JProfiler agent..."
+
+if ! tar -xzf "${CACHED_ARCHIVE}" -C "${INSTALL_DIR}" --strip-components=1; then
+    err "Failed to extract ${ARCHIVE_NAME}. Archive may be corrupt."
+fi
+
+# ── Locate libjprofilerti.so ──────────────────────────────────────────────────
+AGENT_LIB="$(find "${INSTALL_DIR}" -name "libjprofilerti.so" | head -1)"
+if [[ -z "${AGENT_LIB}" ]]; then
+    err "libjprofilerti.so not found after extraction of ${ARCHIVE_NAME}."
+fi
+log "Agent library: ${AGENT_LIB}"
+
+# Derive the runtime path.
+# DEPS_DIR is a temp path during staging (e.g. /tmp/buildpacks/.../deps) but
+# maps to /home/vcap/deps/ at runtime.  We strip the DEPS_DIR prefix and
+# prepend the stable runtime base to produce the absolute runtime path, which
+# is then embedded as a literal in the generated profile.d script.
+AGENT_LIB_RELPATH="${AGENT_LIB#"${DEPS_DIR}/"}"   # e.g. 0/jprofiler/bin/linux-x64/libjprofilerti.so
+AGENT_LIB_RUNTIME="/home/vcap/deps/${AGENT_LIB_RELPATH}"
+
+log "Runtime agent path: ${AGENT_LIB_RUNTIME}"
+
+# ── Generate profile.d script ─────────────────────────────────────────────────
+# This script is SOURCED by the CF launcher (not executed in a sub-shell), so
+# we must use `return` instead of `exit` to avoid killing the launcher process.
+#
+# AGENT_LIB_RUNTIME and JPROFILER_PORT are expanded NOW (staging time) and
+# baked into the script as literals.  All other variables are expanded at
+# runtime (prefixed with \$ in the heredoc).
+
+PROFILE_SCRIPT="${PROFILE_D_DIR}/000_jprofiler.sh"
+
+# shellcheck disable=SC2016  # intentional: $-vars inside heredoc are runtime-expanded
+cat > "${PROFILE_SCRIPT}" <<'HEREDOC_END'
+#!/usr/bin/env bash
+# JProfiler runtime activation script – generated by JProfiler Supply Buildpack.
+# Sourced by the CF launcher before the JVM starts.  Do not edit.
+HEREDOC_END
+
+# Append the dynamic (staging-baked) part
+cat >> "${PROFILE_SCRIPT}" <<HEREDOC_END
+# Staging-baked values
+_JPROFILER_AGENT_LIB="${AGENT_LIB_RUNTIME}"
+_JPROFILER_DEFAULT_PORT="${JPROFILER_PORT}"
+HEREDOC_END
+
+# Append the static runtime logic (single-quoted heredoc – no expansion)
+# shellcheck disable=SC2016
+cat >> "${PROFILE_SCRIPT}" <<'HEREDOC_END'
+
+# ── Runtime configuration ────────────────────────────────────────────────────
+_JPROFILER_ENABLED="${JPROFILER_ENABLED:-false}"
+_JPROFILER_PORT="${JPROFILER_PORT:-${_JPROFILER_DEFAULT_PORT}}"
+_JPROFILER_NOWAIT="${JPROFILER_NOWAIT:-true}"
+_JPROFILER_OPTIONS="${JPROFILER_OPTIONS:-}"
+
+_jprofiler_is_enabled() {
+    case "${1,,}" in
+        true|1|yes|on) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+if ! _jprofiler_is_enabled "${_JPROFILER_ENABLED}"; then
+    return 0
+fi
+
+# Validate port
+if ! [[ "${_JPROFILER_PORT}" =~ ^[0-9]+$ ]] || \
+   (( _JPROFILER_PORT < 1 || _JPROFILER_PORT > 65535 )); then
+    echo " !     JProfiler: JPROFILER_PORT='${_JPROFILER_PORT}' is invalid – aborting." >&2
+    return 1
+fi
+
+if [[ ! -f "${_JPROFILER_AGENT_LIB}" ]]; then
+    echo " !     JProfiler: agent library not found at ${_JPROFILER_AGENT_LIB}" >&2
+    echo " !     Run: cf restage <app> with JPROFILER_ENABLED=true to install the agent." >&2
+    return 1
+fi
+
+# Build agent option string
+_jprofiler_nowait_opt=""
+if _jprofiler_is_enabled "${_JPROFILER_NOWAIT}"; then
+    _jprofiler_nowait_opt=",nowait"
+fi
+
+_jprofiler_extra_opts=""
+if [[ -n "${_JPROFILER_OPTIONS}" ]]; then
+    _jprofiler_extra_opts=",${_JPROFILER_OPTIONS}"
+fi
+
+_JPROFILER_AGENT_ARG="-agentpath:${_JPROFILER_AGENT_LIB}=port=${_JPROFILER_PORT}${_jprofiler_nowait_opt}${_jprofiler_extra_opts}"
+
+# Append to JAVA_TOOL_OPTIONS, preserving any existing value.
+# JAVA_TOOL_OPTIONS is read directly by the JVM (JVMTI spec) so this works
+# regardless of how the SAP Java Buildpack assembles JAVA_OPTS.
+if [[ -n "${JAVA_TOOL_OPTIONS:-}" ]]; then
+    export JAVA_TOOL_OPTIONS="${JAVA_TOOL_OPTIONS} ${_JPROFILER_AGENT_ARG}"
+else
+    export JAVA_TOOL_OPTIONS="${_JPROFILER_AGENT_ARG}"
+fi
+
+echo "-----> JProfiler profiling enabled on port ${_JPROFILER_PORT} (agent: ${_JPROFILER_AGENT_LIB})"
+HEREDOC_END
+
+chmod +x "${PROFILE_SCRIPT}"
+
+log "Runtime profile.d script written: ${PROFILE_SCRIPT}"
+log "JProfiler agent installed successfully."
+log ""
+log "Runtime activation: set JPROFILER_ENABLED=true in your CF manifest."
+log "Access via SSH tunnel: cf ssh <app> -L ${JPROFILER_PORT}:localhost:${JPROFILER_PORT}"

@@ -1,0 +1,20 @@
+# Dependency directories
+deps/
+
+# macOS metadata
+.DS_Store
+
+# JProfiler agent cache (local development)
+cache/
+
+# Test temporary files
+tmp/
+test/tmp/
+
+# Editor artefacts
+.idea/
+*.iml
+.vscode/
+*.swp
+*.swo
+*~

@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Cloud Foundry v2 supply buildpack – detect script
+#
+# A supply buildpack's detect script is not used for conditional detection;
+# the buildpack always participates.  We print a human-readable name and exit 0.
+echo "JProfiler"
+exit 0
