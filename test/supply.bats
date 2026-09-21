@@ -67,12 +67,9 @@ setup_patched_supply() {
     chmod +x "${PATCHED_SUPPLY}"
 }
 
-run_patched() {
+profile_script_path() {
     local deps_idx="${1:-0}"
-    mkdir -p "${DEPS_DIR}/${deps_idx}"
-    JPROFILER_TEST_SKIP_CHECKSUM=1 \
-        bash "${PATCHED_SUPPLY}" \
-            "${BUILD_DIR}" "${CACHE_DIR}" "${DEPS_DIR}" "${deps_idx}"
+    echo "${BUILD_DIR}/.profile.d/000_jprofiler.sh"
 }
 
 # ── Test 1: JPROFILER_ENABLED=false ──────────────────────────────────────────
@@ -90,7 +87,7 @@ run_patched() {
 
 # ── Test 2: JPROFILER_ENABLED=true ───────────────────────────────────────────
 
-@test "JPROFILER_ENABLED=true installs agent and writes JBP_CONFIG_JAVA_OPTS" {
+@test "JPROFILER_ENABLED=true installs agent and writes profile.d script" {
     setup_patched_supply
     make_fake_archive
 
@@ -100,48 +97,48 @@ run_patched() {
 
     [ "${status}" -eq 0 ]
     [ -d "${DEPS_DIR}/0/jprofiler" ]
-    [ -f "${DEPS_DIR}/0/env/JBP_CONFIG_JAVA_OPTS" ]
+    [ -f "$(profile_script_path 0)" ]
 }
 
 # ── Test 3: default port 8849 ─────────────────────────────────────────────────
 
-@test "default port 8849 appears in JBP_CONFIG_JAVA_OPTS" {
+@test "default port 8849 appears in profile.d script" {
     setup_patched_supply
     make_fake_archive
 
     JPROFILER_ENABLED=true JPROFILER_TEST_SKIP_CHECKSUM=1 \
         bash "${PATCHED_SUPPLY}" "${BUILD_DIR}" "${CACHE_DIR}" "${DEPS_DIR}" "0"
 
-    grep -q "port=8849" "${DEPS_DIR}/0/env/JBP_CONFIG_JAVA_OPTS"
+    grep -q "port=8849" "$(profile_script_path 0)"
 }
 
 # ── Test 4: custom port ───────────────────────────────────────────────────────
 
-@test "custom port appears in JBP_CONFIG_JAVA_OPTS" {
+@test "custom port appears in profile.d script" {
     setup_patched_supply
     make_fake_archive
 
     JPROFILER_ENABLED=true JPROFILER_PORT=9999 JPROFILER_TEST_SKIP_CHECKSUM=1 \
         bash "${PATCHED_SUPPLY}" "${BUILD_DIR}" "${CACHE_DIR}" "${DEPS_DIR}" "0"
 
-    grep -q "port=9999" "${DEPS_DIR}/0/env/JBP_CONFIG_JAVA_OPTS"
+    grep -q "port=9999" "$(profile_script_path 0)"
 }
 
-# ── Test 5: existing JBP_CONFIG_JAVA_OPTS is preserved ───────────────────────
+# ── Test 5: existing JAVA_OPTS is preserved ───────────────────────────────────
 
-@test "existing JBP_CONFIG_JAVA_OPTS value is preserved" {
+@test "profile.d script appends to existing JAVA_OPTS" {
     setup_patched_supply
     make_fake_archive
 
     JPROFILER_ENABLED=true JPROFILER_PORT=8849 \
-        JBP_CONFIG_JAVA_OPTS="[java_opts: '-Xshare:off -XX:MaxDirectMemorySize=384M']" \
         JPROFILER_TEST_SKIP_CHECKSUM=1 \
         bash "${PATCHED_SUPPLY}" "${BUILD_DIR}" "${CACHE_DIR}" "${DEPS_DIR}" "0"
 
-    local result
-    result="$(cat "${DEPS_DIR}/0/env/JBP_CONFIG_JAVA_OPTS")"
-    [[ "${result}" == *"-Xshare:off"* ]]
-    [[ "${result}" == *"-agentpath:"* ]]
+    local script
+    script="$(profile_script_path 0)"
+    # The profile.d script should export JAVA_OPTS preserving existing value
+    grep -q 'JAVA_OPTS=' "${script}"
+    grep -q '\${JAVA_OPTS' "${script}"
 }
 
 # ── Test 6: x86_64 architecture mapping ──────────────────────────────────────
@@ -231,15 +228,15 @@ run_patched() {
         JPROFILER_TEST_SKIP_CHECKSUM=1 \
         bash "${PATCHED_SUPPLY}" "${BUILD_DIR}" "${CACHE_DIR}" "${DEPS_DIR}" "0"
 
-    local result
-    result="$(cat "${DEPS_DIR}/0/env/JBP_CONFIG_JAVA_OPTS")"
-    [[ "${result}" == *"loglevel=info"* ]]
-    [[ "${result}" == *"samplingmode=cpu"* ]]
+    local script
+    script="$(profile_script_path 0)"
+    grep -q "loglevel=info" "${script}"
+    grep -q "samplingmode=cpu" "${script}"
 }
 
-# ── Test 11: DEPS_IDX=3 ───────────────────────────────────────────────────────
+# ── Test 11: DEPS_IDX ─────────────────────────────────────────────────────────
 
-@test "DEPS_IDX=3 installs into deps/3 and writes env to deps/3/env/" {
+@test "DEPS_IDX=3 installs into deps/3 and profile.d references correct runtime path" {
     setup_patched_supply
     make_fake_archive
 
@@ -247,11 +244,11 @@ run_patched() {
         bash "${PATCHED_SUPPLY}" "${BUILD_DIR}" "${CACHE_DIR}" "${DEPS_DIR}" "3"
 
     [ -d "${DEPS_DIR}/3/jprofiler" ]
-    [ -f "${DEPS_DIR}/3/env/JBP_CONFIG_JAVA_OPTS" ]
-    grep -q "/home/vcap/deps/3/" "${DEPS_DIR}/3/env/JBP_CONFIG_JAVA_OPTS"
+    [ -f "$(profile_script_path 3)" ]
+    grep -q "/home/vcap/deps/3/" "$(profile_script_path 3)"
 }
 
-@test "DEPS_IDX=7 installs into deps/7 and writes env to deps/7/env/" {
+@test "DEPS_IDX=7 installs into deps/7 and profile.d references correct runtime path" {
     setup_patched_supply
     make_fake_archive
 
@@ -259,21 +256,21 @@ run_patched() {
         bash "${PATCHED_SUPPLY}" "${BUILD_DIR}" "${CACHE_DIR}" "${DEPS_DIR}" "7"
 
     [ -d "${DEPS_DIR}/7/jprofiler" ]
-    [ -f "${DEPS_DIR}/7/env/JBP_CONFIG_JAVA_OPTS" ]
-    grep -q "/home/vcap/deps/7/" "${DEPS_DIR}/7/env/JBP_CONFIG_JAVA_OPTS"
+    [ -f "$(profile_script_path 7)" ]
+    grep -q "/home/vcap/deps/7/" "$(profile_script_path 7)"
 }
 
-# ── Test 12: -agentpath verweist auf installierte Library ────────────────────
+# ── Test 12: agentpath references installed library ──────────────────────────
 
-@test "agentpath in JBP_CONFIG_JAVA_OPTS references /home/vcap/deps/0/jprofiler/.../libjprofilerti.so" {
+@test "agentpath in profile.d references /home/vcap/deps/0/jprofiler/.../libjprofilerti.so" {
     setup_patched_supply
     make_fake_archive
 
     JPROFILER_ENABLED=true JPROFILER_TEST_SKIP_CHECKSUM=1 \
         bash "${PATCHED_SUPPLY}" "${BUILD_DIR}" "${CACHE_DIR}" "${DEPS_DIR}" "0"
 
-    local result
-    result="$(cat "${DEPS_DIR}/0/env/JBP_CONFIG_JAVA_OPTS")"
-    [[ "${result}" == *"-agentpath:/home/vcap/deps/0/jprofiler"* ]]
-    [[ "${result}" == *"libjprofilerti.so"* ]]
+    local script
+    script="$(profile_script_path 0)"
+    grep -q "\-agentpath:/home/vcap/deps/0/jprofiler" "${script}"
+    grep -q "libjprofilerti.so" "${script}"
 }

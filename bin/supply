@@ -10,14 +10,16 @@
 # At runtime, ${DEPS_DIR}/${DEPS_IDX} is mounted at /home/vcap/deps/${DEPS_IDX}.
 #
 # Runtime injection strategy:
-#   Supply buildpacks write files to ${DEPS_DIR}/${DEPS_IDX}/env/ — each file
-#   name is an environment variable set for the final buildpack at staging time.
-#   We write JBP_CONFIG_JAVA_OPTS so the SAP Java Buildpack bakes -agentpath
-#   into the hardcoded JAVA_OPTS literal in the start command.
-#   This targets only the main JVM, not pre-start JVM processes (e.g. keytool).
+#   We write a profile.d script that appends -agentpath to JAVA_OPTS at
+#   container startup, before start.sh runs.  The SAP Java Buildpack's
+#   start.sh reads $JAVA_OPTS dynamically at runtime (not hardcoded at
+#   staging), so this works correctly.
 #
 #   JAVA_TOOL_OPTIONS was tried first but affects ALL JVMs in the container,
-#   including pre-start processes like keytool which randomly claim the port.
+#   including pre-start keytool processes that randomly claim the profiler port.
+#
+#   JBP_CONFIG_JAVA_OPTS via env/ files was tried second but the SAP Java
+#   Buildpack does not read it from supply buildpack env-files at staging time.
 #
 # See docs/design.md for the full rationale.
 
@@ -213,37 +215,31 @@ fi
 
 AGENT_ARG="-agentpath:${AGENT_LIB_RUNTIME}=port=${JPROFILER_PORT}${NOWAIT_OPT}${EXTRA_OPTS}"
 
-# ── Inject via JBP_CONFIG_JAVA_OPTS (staging-time) ───────────────────────────
-# JAVA_TOOL_OPTIONS is injected by all JVMs in the container (including
-# pre-start keytool processes) and cannot target only the main JVM.
-#
-# The correct mechanism: supply buildpacks write files to
-# ${DEPS_DIR}/${DEPS_IDX}/env/ — each file name is an environment variable,
-# its content is the value.  The CF buildpack runner sets these variables
-# before executing the final buildpack (SAP Java Buildpack).
-#
-# The SAP Java Buildpack reads JBP_CONFIG_JAVA_OPTS at staging time and appends
-# its java_opts value to the hardcoded JAVA_OPTS literal in the start command.
-# This means -agentpath ends up only in the main JVM invocation, not in
-# pre-start JVM processes like keytool.
-#
-# JBP_CONFIG_JAVA_OPTS syntax: [java_opts: '-flag1 -flag2']
-# Preserve any existing value the user already set.
-ENV_DIR="${DEPS_DIR}/${DEPS_IDX}/env"
-mkdir -p "${ENV_DIR}"
+# ── Write profile.d script (runtime JAVA_OPTS injection) ─────────────────────
+# start.sh reads $JAVA_OPTS dynamically at runtime — it is not hardcoded at
+# staging.  A profile.d script is sourced before start.sh runs, so appending
+# -agentpath to JAVA_OPTS here is sufficient.
+# JAVA_OPTS is not read by pre-start JVM tools (keytool etc.), so there is no
+# port-conflict risk.
+PROFILE_D_DIR="${BUILD_DIR}/.profile.d"
+mkdir -p "${PROFILE_D_DIR}"
 
-EXISTING_JBP_OPTS="${JBP_CONFIG_JAVA_OPTS:-}"
-if [[ -n "${EXISTING_JBP_OPTS}" ]]; then
-    # Strip surrounding [java_opts: '...'] wrapper and append
-    INNER="${EXISTING_JBP_OPTS#\[java_opts: \'}"
-    INNER="${INNER%\'\]}"
-    NEW_JBP_OPTS="[java_opts: '${INNER} ${AGENT_ARG}']"
-else
-    NEW_JBP_OPTS="[java_opts: '${AGENT_ARG}']"
+PROFILE_SCRIPT="${PROFILE_D_DIR}/000_jprofiler.sh"
+
+cat > "${PROFILE_SCRIPT}" <<PROFILE_EOF
+#!/bin/bash
+# Injected by JProfiler supply buildpack
+_JPROFILER_AGENT_LIB="${AGENT_LIB_RUNTIME}"
+if [ ! -f "\${_JPROFILER_AGENT_LIB}" ]; then
+    echo " !     JProfiler: agent library not found at \${_JPROFILER_AGENT_LIB}" >&2
+    echo " !     Run: cf restage <app> with JPROFILER_ENABLED=true to install the agent." >&2
+    exit 1
 fi
+export JAVA_OPTS="\${JAVA_OPTS:-} ${AGENT_ARG}"
+PROFILE_EOF
 
-printf '%s' "${NEW_JBP_OPTS}" > "${ENV_DIR}/JBP_CONFIG_JAVA_OPTS"
+chmod +x "${PROFILE_SCRIPT}"
 
-log "Injected into JBP_CONFIG_JAVA_OPTS: ${NEW_JBP_OPTS}"
+log "Runtime profile.d script written: ${PROFILE_SCRIPT}"
 log "JProfiler agent installed successfully."
 log "Access via SSH tunnel: cf ssh <app> -L ${JPROFILER_PORT}:localhost:${JPROFILER_PORT}"
