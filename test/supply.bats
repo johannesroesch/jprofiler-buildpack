@@ -77,13 +77,15 @@ run_patched() {
 
 # ── Test 1: JPROFILER_ENABLED=false ──────────────────────────────────────────
 
-@test "JPROFILER_ENABLED=false exits 0 and installs nothing" {
+@test "JPROFILER_ENABLED=false exits 0, writes config.yml, installs nothing else" {
     run env JPROFILER_ENABLED=false \
         bash "${SUPPLY}" "${BUILD_DIR}" "${CACHE_DIR}" "${DEPS_DIR}" "0"
 
     [ "${status}" -eq 0 ]
     [[ "${output}" == *"JPROFILER_ENABLED is false"* ]]
     [ ! -d "${DEPS_DIR}/0/jprofiler" ]
+    [ -f "${DEPS_DIR}/0/config.yml" ]
+    grep -q "name: jprofiler" "${DEPS_DIR}/0/config.yml"
 }
 
 # ── Test 2: JPROFILER_ENABLED=true ───────────────────────────────────────────

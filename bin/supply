@@ -58,6 +58,16 @@ JPROFILER_ENABLED="${JPROFILER_ENABLED:-false}"
 step "JProfiler Supply Buildpack"
 log "JProfiler version: ${JPROFILER_VERSION}"
 
+# config.yml is required by the CF v2 supply buildpack contract regardless of
+# whether the agent is enabled.  The SAP Java Buildpack reads it to enumerate
+# supply buildpack dependencies and fails if it is absent.
+mkdir -p "${DEPS_DIR}/${DEPS_IDX}"
+cat > "${DEPS_DIR}/${DEPS_IDX}/config.yml" <<CONFIG_EOF
+---
+name: jprofiler
+version: ${JPROFILER_VERSION}
+CONFIG_EOF
+
 if ! is_enabled "${JPROFILER_ENABLED}"; then
     log "JPROFILER_ENABLED is false – skipping agent installation."
     log "The buildpack completed successfully (no-op)."
