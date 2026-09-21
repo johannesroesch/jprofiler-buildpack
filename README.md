@@ -27,22 +27,19 @@ manifest, with no changes to application code or artifacts.
 
 ---
 
-## Runtime integration: JBP_CONFIG_JAVA_OPTS
+## Runtime integration decision: JAVA_TOOL_OPTIONS
 
-This buildpack injects `-agentpath` by writing `JBP_CONFIG_JAVA_OPTS` to
-`${DEPS_DIR}/${DEPS_IDX}/env/` during staging.
+This buildpack sets `JAVA_TOOL_OPTIONS` (not `JAVA_OPTS`) to inject
+`-agentpath`.
 
-The CF buildpack runner picks up env-files from supply buildpacks and sets them
-as environment variables before the final buildpack runs.  The SAP Java
-Buildpack reads `JBP_CONFIG_JAVA_OPTS` at staging time and bakes its
-`java_opts` value into the hardcoded `JAVA_OPTS` literal in the generated
-start command.  Because this happens at staging, `-agentpath` ends up only in
-the main JVM invocation — pre-start JVM processes such as `keytool` are not
-affected.
+`JAVA_TOOL_OPTIONS` is defined by the JVM Tool Interface (JVMTI) specification
+and is read directly by the JVM at startup, independent of which Java Buildpack
+assembles `JAVA_OPTS`.  This avoids ordering dependencies between the supply
+buildpack's profile.d script and the SAP Java Buildpack's internal
+`00_java_opts.sh` assembly script.
 
-`JAVA_TOOL_OPTIONS` was tried first but was rejected: it is read by every JVM
-in the container, including pre-start `keytool` processes that randomly claim
-the profiler port before the application JVM starts.
+The existing `JAVA_OPTS` value (set in the CF app environment) is preserved as-
+is; the two variables are additive from the JVM's perspective.
 
 Full rationale: [docs/design.md](docs/design.md).
 
@@ -64,7 +61,7 @@ applications:
   - name: my-app
 
     buildpacks:
-      - https://github.com/johannesroesch/jprofiler-buildpack.git
+      - https://github.example.com/example/jprofiler-buildpack.git
       - java_buildpack                          # or sap_java_buildpack
 
     env:
@@ -111,17 +108,19 @@ string, resulting in:
 -agentpath:/home/vcap/deps/0/jprofiler/bin/linux-x64/libjprofilerti.so=port=8849,nowait,loglevel=info,samplingmode=cpu
 ```
 
-### Staging-time configuration
+### Staging-time vs runtime configuration
 
-`JPROFILER_ENABLED` is evaluated **only at staging time**:
+`JPROFILER_ENABLED` is evaluated at **both** staging time and runtime:
 
-- If `false`, the agent archive is not downloaded and `-agentpath` is not
-  injected into the start command.
-- If `true`, the agent is installed and `-agentpath` is baked into the
-  hardcoded `JAVA_OPTS` literal in the start command.
+- At **staging**: if `false`, the agent archive is not downloaded (saves ~5 MB
+  of staging time and cache space).
+- At **runtime**: if `false`, the profile.d script exits immediately without
+  setting `JAVA_TOOL_OPTIONS`, so the agent is not attached.
 
-Because the injection happens at staging, changing `JPROFILER_ENABLED` after
-deployment **requires a restage** — a plain `cf restart` is not sufficient.
+This means you can enable the buildpack at staging time and disable it at
+runtime by setting `JPROFILER_ENABLED=false` in a running app's environment
+without restaging.  Conversely, if profiling was not enabled at staging time,
+restaging is required to install the agent.
 
 ---
 
@@ -197,20 +196,16 @@ Expected output (exact path depends on `DEPS_IDX`):
 /home/vcap/deps/0/jprofiler/bin/linux-x64/libjprofilerti.so
 ```
 
-### Check that the start command contains -agentpath
-
-After `cf push`, inspect the start command logged by the SAP Java Buildpack
-during staging.  It should contain `-agentpath:` in the `JAVA_OPTS` literal:
-
-```
-JAVA_OPTS="... -agentpath:/home/vcap/deps/0/jprofiler/bin/linux-x64/libjprofilerti.so=port=8849,nowait ..."
-```
-
-You can also check inside the running container:
+### Check that JAVA_TOOL_OPTIONS contains -agentpath
 
 ```bash
-cf ssh my-app
-ps aux | grep java
+echo "$JAVA_TOOL_OPTIONS"
+```
+
+Expected output when profiling is enabled:
+
+```
+-agentpath:/home/vcap/deps/0/jprofiler/bin/linux-x64/libjprofilerti.so=port=8849,nowait
 ```
 
 ### Check the running JVM process
@@ -317,30 +312,31 @@ If you see this error on a supported architecture, open an issue.
 
 **Checks**:
 
-1. Confirm the staging log showed `JBP_CONFIG_JAVA_OPTS` was set. Look for:
-   ```
-   -----> JProfiler Supply Buildpack
-          Injected into JBP_CONFIG_JAVA_OPTS: [java_opts: '-agentpath:...']
-   ```
-2. Confirm `-agentpath` is in the start command baked by the SAP Java Buildpack:
+1. Confirm the profile.d script exists:
    ```bash
-   cf ssh my-app -- bash -c 'cat /proc/1/cmdline | tr "\0" "\n"'
+   ls /home/vcap/app/.profile.d/
    ```
-3. If `JPROFILER_ENABLED` was `false` at staging time, the agent was not
-   installed.  Restage with `JPROFILER_ENABLED=true`.
+2. Confirm it is being sourced; look for this line in `cf logs`:
+   ```
+   -----> JProfiler profiling enabled on port 8849
+   ```
+3. Confirm `JAVA_TOOL_OPTIONS` is set in the container environment:
+   ```bash
+   echo "$JAVA_TOOL_OPTIONS"
+   ```
+4. Check whether the Java Buildpack ignores `JAVA_TOOL_OPTIONS`.  All
+   standard JVMs honour this variable (it is part of the JVMTI specification);
+   the buildpack does not need to do anything with it.
 
 ---
 
 ### Interaction with existing JAVA_OPTS
 
-Set `JBP_CONFIG_JAVA_OPTS` in your CF manifest to pass additional JVM flags.
-The buildpack merges them with `-agentpath` — it does not overwrite your value.
+`JAVA_OPTS` and `JAVA_TOOL_OPTIONS` are independent.  This buildpack appends to
+`JAVA_TOOL_OPTIONS` only.  Your existing `JAVA_OPTS` value is not modified.
 
-```yaml
-env:
-  JBP_CONFIG_JAVA_OPTS: "[java_opts: '-Xshare:off -XX:MaxDirectMemorySize=384M']"
-  JPROFILER_ENABLED: "true"
-```
+If you see duplicate flags, verify that you have not also added `-agentpath`
+manually to `JAVA_OPTS` or `JAVA_TOOL_OPTIONS`.
 
 ---
 
