@@ -10,16 +10,20 @@
 # At runtime, ${DEPS_DIR}/${DEPS_IDX} is mounted at /home/vcap/deps/${DEPS_IDX}.
 #
 # Runtime injection strategy:
-#   We write a profile.d script that appends -agentpath to JAVA_OPTS at
-#   container startup, before start.sh runs.  The SAP Java Buildpack's
-#   start.sh reads $JAVA_OPTS dynamically at runtime (not hardcoded at
-#   staging), so this works correctly.
+#   We write ${DEPS_DIR}/${DEPS_IDX}/env/JAVA_OPTS so that CF sets it as a
+#   real container environment variable before the app starts.  The SAP Java
+#   Buildpack's start.sh reads $JAVA_OPTS dynamically at runtime via:
+#     eval exec $JAVA_HOME/bin/java $JBP_MEMORY $JAVA_OPTS ...
+#   so the value from the env-file is picked up directly.
 #
-#   JAVA_TOOL_OPTIONS was tried first but affects ALL JVMs in the container,
-#   including pre-start keytool processes that randomly claim the profiler port.
-#
-#   JBP_CONFIG_JAVA_OPTS via env/ files was tried second but the SAP Java
-#   Buildpack does not read it from supply buildpack env-files at staging time.
+#   Approaches tried and rejected:
+#   - JAVA_TOOL_OPTIONS: read by ALL JVMs including pre-start keytool,
+#     which randomly claims the profiler port before JarLauncher starts.
+#   - JBP_CONFIG_JAVA_OPTS via env-file: the SAP Java Buildpack does not
+#     read this from supply buildpack env-files at staging time.
+#   - profile.d script setting JAVA_OPTS: profile.d is sourced after the
+#     initial container environment is frozen; start.sh reads the original
+#     JAVA_OPTS value, not the one written by profile.d.
 #
 # See docs/design.md for the full rationale.
 
@@ -215,31 +219,22 @@ fi
 
 AGENT_ARG="-agentpath:${AGENT_LIB_RUNTIME}=port=${JPROFILER_PORT}${NOWAIT_OPT}${EXTRA_OPTS}"
 
-# ── Write profile.d script (runtime JAVA_OPTS injection) ─────────────────────
-# start.sh reads $JAVA_OPTS dynamically at runtime — it is not hardcoded at
-# staging.  A profile.d script is sourced before start.sh runs, so appending
-# -agentpath to JAVA_OPTS here is sufficient.
-# JAVA_OPTS is not read by pre-start JVM tools (keytool etc.), so there is no
-# port-conflict risk.
-PROFILE_D_DIR="${BUILD_DIR}/.profile.d"
-mkdir -p "${PROFILE_D_DIR}"
+# ── Inject via ${DEPS_DIR}/${DEPS_IDX}/env/JAVA_OPTS ─────────────────────────
+# CF sets files in env/ as real container environment variables before the app
+# starts.  start.sh reads $JAVA_OPTS at runtime, so this value is picked up
+# directly.  We append to any existing JAVA_OPTS the user has set via CF env.
+ENV_DIR="${DEPS_DIR}/${DEPS_IDX}/env"
+mkdir -p "${ENV_DIR}"
 
-PROFILE_SCRIPT="${PROFILE_D_DIR}/000_jprofiler.sh"
-
-cat > "${PROFILE_SCRIPT}" <<PROFILE_EOF
-#!/bin/bash
-# Injected by JProfiler supply buildpack
-_JPROFILER_AGENT_LIB="${AGENT_LIB_RUNTIME}"
-if [ ! -f "\${_JPROFILER_AGENT_LIB}" ]; then
-    echo " !     JProfiler: agent library not found at \${_JPROFILER_AGENT_LIB}" >&2
-    echo " !     Run: cf restage <app> with JPROFILER_ENABLED=true to install the agent." >&2
-    exit 1
+EXISTING_JAVA_OPTS="${JAVA_OPTS:-}"
+if [[ -n "${EXISTING_JAVA_OPTS}" ]]; then
+    NEW_JAVA_OPTS="${EXISTING_JAVA_OPTS} ${AGENT_ARG}"
+else
+    NEW_JAVA_OPTS="${AGENT_ARG}"
 fi
-export JAVA_OPTS="\${JAVA_OPTS:-} ${AGENT_ARG}"
-PROFILE_EOF
 
-chmod +x "${PROFILE_SCRIPT}"
+printf '%s' "${NEW_JAVA_OPTS}" > "${ENV_DIR}/JAVA_OPTS"
 
-log "Runtime profile.d script written: ${PROFILE_SCRIPT}"
+log "Injected -agentpath into JAVA_OPTS env-file."
 log "JProfiler agent installed successfully."
 log "Access via SSH tunnel: cf ssh <app> -L ${JPROFILER_PORT}:localhost:${JPROFILER_PORT}"

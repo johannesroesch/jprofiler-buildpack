@@ -67,9 +67,9 @@ setup_patched_supply() {
     chmod +x "${PATCHED_SUPPLY}"
 }
 
-profile_script_path() {
+env_file() {
     local deps_idx="${1:-0}"
-    echo "${BUILD_DIR}/.profile.d/000_jprofiler.sh"
+    echo "${DEPS_DIR}/${deps_idx}/env/JAVA_OPTS"
 }
 
 # ── Test 1: JPROFILER_ENABLED=false ──────────────────────────────────────────
@@ -87,7 +87,7 @@ profile_script_path() {
 
 # ── Test 2: JPROFILER_ENABLED=true ───────────────────────────────────────────
 
-@test "JPROFILER_ENABLED=true installs agent and writes profile.d script" {
+@test "JPROFILER_ENABLED=true installs agent and writes JAVA_OPTS env-file" {
     setup_patched_supply
     make_fake_archive
 
@@ -97,48 +97,48 @@ profile_script_path() {
 
     [ "${status}" -eq 0 ]
     [ -d "${DEPS_DIR}/0/jprofiler" ]
-    [ -f "$(profile_script_path 0)" ]
+    [ -f "$(env_file 0)" ]
 }
 
 # ── Test 3: default port 8849 ─────────────────────────────────────────────────
 
-@test "default port 8849 appears in profile.d script" {
+@test "default port 8849 appears in JAVA_OPTS env-file" {
     setup_patched_supply
     make_fake_archive
 
     JPROFILER_ENABLED=true JPROFILER_TEST_SKIP_CHECKSUM=1 \
         bash "${PATCHED_SUPPLY}" "${BUILD_DIR}" "${CACHE_DIR}" "${DEPS_DIR}" "0"
 
-    grep -q "port=8849" "$(profile_script_path 0)"
+    grep -q "port=8849" "$(env_file 0)"
 }
 
 # ── Test 4: custom port ───────────────────────────────────────────────────────
 
-@test "custom port appears in profile.d script" {
+@test "custom port appears in JAVA_OPTS env-file" {
     setup_patched_supply
     make_fake_archive
 
     JPROFILER_ENABLED=true JPROFILER_PORT=9999 JPROFILER_TEST_SKIP_CHECKSUM=1 \
         bash "${PATCHED_SUPPLY}" "${BUILD_DIR}" "${CACHE_DIR}" "${DEPS_DIR}" "0"
 
-    grep -q "port=9999" "$(profile_script_path 0)"
+    grep -q "port=9999" "$(env_file 0)"
 }
 
 # ── Test 5: existing JAVA_OPTS is preserved ───────────────────────────────────
 
-@test "profile.d script appends to existing JAVA_OPTS" {
+@test "existing JAVA_OPTS value is preserved in env-file" {
     setup_patched_supply
     make_fake_archive
 
     JPROFILER_ENABLED=true JPROFILER_PORT=8849 \
+        JAVA_OPTS="-Xshare:off -XX:MaxDirectMemorySize=384M" \
         JPROFILER_TEST_SKIP_CHECKSUM=1 \
         bash "${PATCHED_SUPPLY}" "${BUILD_DIR}" "${CACHE_DIR}" "${DEPS_DIR}" "0"
 
-    local script
-    script="$(profile_script_path 0)"
-    # The profile.d script should export JAVA_OPTS preserving existing value
-    grep -q 'JAVA_OPTS=' "${script}"
-    grep -q '\${JAVA_OPTS' "${script}"
+    local result
+    result="$(cat "$(env_file 0)")"
+    [[ "${result}" == *"-Xshare:off"* ]]
+    [[ "${result}" == *"-agentpath:"* ]]
 }
 
 # ── Test 6: x86_64 architecture mapping ──────────────────────────────────────
@@ -228,15 +228,15 @@ profile_script_path() {
         JPROFILER_TEST_SKIP_CHECKSUM=1 \
         bash "${PATCHED_SUPPLY}" "${BUILD_DIR}" "${CACHE_DIR}" "${DEPS_DIR}" "0"
 
-    local script
-    script="$(profile_script_path 0)"
-    grep -q "loglevel=info" "${script}"
-    grep -q "samplingmode=cpu" "${script}"
+    local result
+    result="$(cat "$(env_file 0)")"
+    [[ "${result}" == *"loglevel=info"* ]]
+    [[ "${result}" == *"samplingmode=cpu"* ]]
 }
 
 # ── Test 11: DEPS_IDX ─────────────────────────────────────────────────────────
 
-@test "DEPS_IDX=3 installs into deps/3 and profile.d references correct runtime path" {
+@test "DEPS_IDX=3 installs into deps/3 and writes JAVA_OPTS to deps/3/env/" {
     setup_patched_supply
     make_fake_archive
 
@@ -244,11 +244,11 @@ profile_script_path() {
         bash "${PATCHED_SUPPLY}" "${BUILD_DIR}" "${CACHE_DIR}" "${DEPS_DIR}" "3"
 
     [ -d "${DEPS_DIR}/3/jprofiler" ]
-    [ -f "$(profile_script_path 3)" ]
-    grep -q "/home/vcap/deps/3/" "$(profile_script_path 3)"
+    [ -f "$(env_file 3)" ]
+    grep -q "/home/vcap/deps/3/" "$(env_file 3)"
 }
 
-@test "DEPS_IDX=7 installs into deps/7 and profile.d references correct runtime path" {
+@test "DEPS_IDX=7 installs into deps/7 and writes JAVA_OPTS to deps/7/env/" {
     setup_patched_supply
     make_fake_archive
 
@@ -256,21 +256,21 @@ profile_script_path() {
         bash "${PATCHED_SUPPLY}" "${BUILD_DIR}" "${CACHE_DIR}" "${DEPS_DIR}" "7"
 
     [ -d "${DEPS_DIR}/7/jprofiler" ]
-    [ -f "$(profile_script_path 7)" ]
-    grep -q "/home/vcap/deps/7/" "$(profile_script_path 7)"
+    [ -f "$(env_file 7)" ]
+    grep -q "/home/vcap/deps/7/" "$(env_file 7)"
 }
 
 # ── Test 12: agentpath references installed library ──────────────────────────
 
-@test "agentpath in profile.d references /home/vcap/deps/0/jprofiler/.../libjprofilerti.so" {
+@test "agentpath in JAVA_OPTS env-file references /home/vcap/deps/0/jprofiler/.../libjprofilerti.so" {
     setup_patched_supply
     make_fake_archive
 
     JPROFILER_ENABLED=true JPROFILER_TEST_SKIP_CHECKSUM=1 \
         bash "${PATCHED_SUPPLY}" "${BUILD_DIR}" "${CACHE_DIR}" "${DEPS_DIR}" "0"
 
-    local script
-    script="$(profile_script_path 0)"
-    grep -q "\-agentpath:/home/vcap/deps/0/jprofiler" "${script}"
-    grep -q "libjprofilerti.so" "${script}"
+    local result
+    result="$(cat "$(env_file 0)")"
+    [[ "${result}" == *"-agentpath:/home/vcap/deps/0/jprofiler"* ]]
+    [[ "${result}" == *"libjprofilerti.so"* ]]
 }
